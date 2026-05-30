@@ -105,12 +105,5 @@ exclude: [
   "Gemfile",
   "Gemfile.lock",
   "vendor",
-  "reveal.js/test",
-  "reveal.js/index.html",
-  "reveal.js/README.md",
-  "reveal.js/bower.json",
-  "reveal.js/Gruntfile.js",
-  "reveal.js/CONTRIBUTING.md",
-  "reveal.js/LICENSE",
-  "reveal.js/package.json"
+  "node_modules"
 ]
