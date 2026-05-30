@@ -113,6 +113,7 @@ class SheetsReportWriter:
         self._build_summary(spreadsheet)
         self._build_expense_by_category(spreadsheet)
         self._build_income_by_category(spreadsheet)
+        self._build_transactions(spreadsheet)
         self._build_budget_overview(spreadsheet)
         self._build_accounts(spreadsheet)
 
@@ -138,6 +139,7 @@ class SheetsReportWriter:
         self._build_summary(spreadsheet)
         self._build_expense_by_category(spreadsheet)
         self._build_income_by_category(spreadsheet)
+        self._build_transactions(spreadsheet)
         self._build_budget_overview(spreadsheet)
         self._build_accounts(spreadsheet)
 
@@ -300,6 +302,66 @@ class SheetsReportWriter:
 
         ws.update(range_name="A1", values=rows)
         ws.format("A1:{}1".format(chr(64 + len(headers))), {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.18, "green": 0.33, "blue": 0.59}, "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}})
+
+    def _build_transactions(self, spreadsheet):
+        ws = spreadsheet.add_worksheet("Transactions", rows=2000, cols=10)
+        monthly_ranges = _get_monthly_ranges(self.months_back)
+
+        if monthly_ranges:
+            start = monthly_ranges[0][0]
+            end = monthly_ranges[-1][1]
+        else:
+            start = date.today() - timedelta(days=365)
+            end = date.today()
+
+        recurring_only = self.filter_config.get("recurring_only", False)
+
+        all_transactions = []
+        if self._account_ids:
+            for aid in self._account_ids:
+                try:
+                    tx_groups = self.client.get_account_transactions(aid, start, end, tx_type="withdrawal")
+                except Exception:
+                    continue
+                for group in tx_groups:
+                    attrs = group.get("attributes", {})
+                    for tx in attrs.get("transactions", []):
+                        all_transactions.append(tx)
+        else:
+            try:
+                tx_groups = self.client.get_transactions(start, end, tx_type="withdrawal")
+            except Exception:
+                tx_groups = []
+            for group in tx_groups:
+                attrs = group.get("attributes", {})
+                for tx in attrs.get("transactions", []):
+                    all_transactions.append(tx)
+
+        if recurring_only:
+            all_transactions = [
+                tx for tx in all_transactions
+                if tx.get("bill_id") or tx.get("recurrence_id")
+            ]
+
+        all_transactions.sort(key=lambda tx: tx.get("date", ""), reverse=True)
+
+        headers = ["Date", "Amount", "Source Account", "Destination", "Category", "Description", "Bill/Recurring"]
+        rows = [headers]
+
+        for tx in all_transactions:
+            tx_date = tx.get("date", "")[:10]
+            amount = _fmt_currency(abs(float(tx.get("amount", 0))))
+            source = tx.get("source_name", "")
+            destination = tx.get("destination_name", "")
+            category = tx.get("category_name") or ""
+            description = tx.get("description", "")
+            is_bill = "Yes" if tx.get("bill_id") else ""
+            if tx.get("recurrence_id"):
+                is_bill = "Yes (recurring)"
+            rows.append([tx_date, amount, source, destination, category, description, is_bill])
+
+        ws.update(range_name="A1", values=rows)
+        ws.format("A1:G1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.18, "green": 0.33, "blue": 0.59}, "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}})
 
     def _build_budget_overview(self, spreadsheet):
         ws = spreadsheet.add_worksheet("Budget Overview", rows=100, cols=10)

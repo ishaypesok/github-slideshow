@@ -202,6 +202,7 @@ class ReportGenerator:
         self._build_summary_sheet()
         self._build_expense_by_category_sheet()
         self._build_income_sheet()
+        self._build_transactions_sheet()
         self._build_budget_sheet()
         self._build_accounts_sheet()
 
@@ -488,6 +489,83 @@ class ReportGenerator:
         ws.column_dimensions["A"].width = 22
         for col in range(2, total_cols + 1):
             ws.column_dimensions[get_column_letter(col)].width = 14
+
+    def _build_transactions_sheet(self):
+        """Individual transactions with source account details."""
+        ws = self.wb.create_sheet("Transactions")
+        monthly_ranges = _get_monthly_ranges(self.months_back)
+
+        headers = ["Date", "Amount", "Source Account", "Destination", "Category", "Description", "Bill/Recurring"]
+        for col, header in enumerate(headers, 1):
+            ws.cell(row=1, column=col, value=header)
+        _style_header_row(ws, 1, len(headers))
+
+        if monthly_ranges:
+            start = monthly_ranges[0][0]
+            end = monthly_ranges[-1][1]
+        else:
+            start = date.today() - timedelta(days=365)
+            end = date.today()
+
+        recurring_only = self.filter_config.get("recurring_only", False)
+
+        all_transactions = []
+        if self._account_ids:
+            for aid in self._account_ids:
+                try:
+                    tx_groups = self.client.get_account_transactions(aid, start, end, tx_type="withdrawal")
+                except Exception:
+                    continue
+                for group in tx_groups:
+                    attrs = group.get("attributes", {})
+                    for tx in attrs.get("transactions", []):
+                        all_transactions.append(tx)
+        else:
+            try:
+                tx_groups = self.client.get_transactions(start, end, tx_type="withdrawal")
+            except Exception:
+                tx_groups = []
+            for group in tx_groups:
+                attrs = group.get("attributes", {})
+                for tx in attrs.get("transactions", []):
+                    all_transactions.append(tx)
+
+        if recurring_only:
+            all_transactions = [
+                tx for tx in all_transactions
+                if tx.get("bill_id") or tx.get("recurrence_id")
+            ]
+
+        all_transactions.sort(key=lambda tx: tx.get("date", ""), reverse=True)
+
+        for idx, tx in enumerate(all_transactions):
+            row = idx + 2
+            tx_date = tx.get("date", "")[:10]
+            amount = abs(float(tx.get("amount", 0)))
+            source = tx.get("source_name", "")
+            destination = tx.get("destination_name", "")
+            category = tx.get("category_name") or ""
+            description = tx.get("description", "")
+            is_bill = "Yes" if tx.get("bill_id") else ""
+            if tx.get("recurrence_id"):
+                is_bill = "Yes (recurring)"
+
+            ws.cell(row=row, column=1, value=tx_date)
+            _style_data_cell(ws, row, 1)
+            _style_data_cell(ws, row, 2, is_currency=True).value = amount
+            _style_data_cell(ws, row, 3).value = source
+            _style_data_cell(ws, row, 4).value = destination
+            _style_data_cell(ws, row, 5).value = category
+            _style_data_cell(ws, row, 6).value = description
+            _style_data_cell(ws, row, 7).value = is_bill
+
+        ws.column_dimensions["A"].width = 12
+        ws.column_dimensions["B"].width = 14
+        ws.column_dimensions["C"].width = 25
+        ws.column_dimensions["D"].width = 25
+        ws.column_dimensions["E"].width = 20
+        ws.column_dimensions["F"].width = 35
+        ws.column_dimensions["G"].width = 15
 
     def _build_budget_sheet(self):
         """Budget overview with spent vs budgeted."""
