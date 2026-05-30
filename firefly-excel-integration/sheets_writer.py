@@ -8,6 +8,12 @@ from google.oauth2.service_account import Credentials
 import gspread
 
 from firefly_client import FireflyClient
+from report_generator import (
+    _resolve_account_ids,
+    _get_filtered_expenses,
+    _aggregate_by_category,
+    _aggregate_total,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +82,18 @@ class SheetsReportWriter:
         credentials_file: str,
         months_back: int = 12,
         forecast_months: int = 3,
+        filter_config: dict | None = None,
     ):
         self.client = client
         self.months_back = months_back
         self.forecast_months = forecast_months
+        self.filter_config = filter_config or {}
+        self.use_filters = bool(
+            self.filter_config.get("account_filters") or self.filter_config.get("recurring_only")
+        )
+        self._account_ids: list[str] | None = None
+        if self.filter_config.get("account_filters"):
+            self._account_ids = _resolve_account_ids(client, self.filter_config["account_filters"])
         creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
         self.gc = gspread.authorize(creds)
 
@@ -152,11 +166,20 @@ class SheetsReportWriter:
                 inc_total = sum(abs(float(i.get("difference_float", 0))) for i in inc_data)
             except Exception:
                 inc_total = 0.0
-            try:
-                exp_data = self.client.get_insight_expense_total(start, end)
-                exp_total = sum(abs(float(i.get("difference_float", 0))) for i in exp_data)
-            except Exception:
-                exp_total = 0.0
+
+            if self.use_filters:
+                filtered_txs = _get_filtered_expenses(
+                    self.client, start, end,
+                    account_ids=self._account_ids,
+                    recurring_only=self.filter_config.get("recurring_only", False),
+                )
+                exp_total = _aggregate_total(filtered_txs)
+            else:
+                try:
+                    exp_data = self.client.get_insight_expense_total(start, end)
+                    exp_total = sum(abs(float(i.get("difference_float", 0))) for i in exp_data)
+                except Exception:
+                    exp_total = 0.0
 
             incomes.append(inc_total)
             expenses.append(exp_total)
@@ -183,21 +206,39 @@ class SheetsReportWriter:
 
         for start, end, label in monthly_ranges:
             month_labels.append(label)
-            try:
-                data = self.client.get_insight_expense_category(start, end)
-            except Exception:
-                data = []
-            seen = set()
-            for item in data:
-                name = item.get("name", "Uncategorized")
-                amount = abs(float(item.get("difference_float", 0)))
-                if name not in category_monthly:
-                    category_monthly[name] = [0.0] * len(month_labels[:-1])
-                category_monthly[name].append(amount)
-                seen.add(name)
-            for name in category_monthly:
-                if name not in seen:
-                    category_monthly[name].append(0.0)
+
+            if self.use_filters:
+                filtered_txs = _get_filtered_expenses(
+                    self.client, start, end,
+                    account_ids=self._account_ids,
+                    recurring_only=self.filter_config.get("recurring_only", False),
+                )
+                cat_amounts = _aggregate_by_category(filtered_txs)
+                seen = set()
+                for name, amount in cat_amounts.items():
+                    if name not in category_monthly:
+                        category_monthly[name] = [0.0] * len(month_labels[:-1])
+                    category_monthly[name].append(amount)
+                    seen.add(name)
+                for name in category_monthly:
+                    if name not in seen:
+                        category_monthly[name].append(0.0)
+            else:
+                try:
+                    data = self.client.get_insight_expense_category(start, end)
+                except Exception:
+                    data = []
+                seen = set()
+                for item in data:
+                    name = item.get("name", "Uncategorized")
+                    amount = abs(float(item.get("difference_float", 0)))
+                    if name not in category_monthly:
+                        category_monthly[name] = [0.0] * len(month_labels[:-1])
+                    category_monthly[name].append(amount)
+                    seen.add(name)
+                for name in category_monthly:
+                    if name not in seen:
+                        category_monthly[name].append(0.0)
 
         if not category_monthly:
             ws.update(range_name="A1", values=[["No expense data found."]])

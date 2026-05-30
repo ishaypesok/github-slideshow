@@ -133,3 +133,30 @@ class FireflyClient:
             "insight/expense/budget",
             {"start": start.isoformat(), "end": end.isoformat()},
         )
+
+    def get_account_transactions(
+        self,
+        account_id: str,
+        start: date | None = None,
+        end: date | None = None,
+        tx_type: str = "all",
+    ) -> list[dict]:
+        """List transactions for a specific account."""
+        params: dict[str, Any] = {"type": tx_type}
+        if start:
+            params["start"] = start.isoformat()
+        if end:
+            params["end"] = end.isoformat()
+        return self._get_all_pages(f"accounts/{account_id}/transactions", params)
+
+    def get_bills(self) -> list[dict]:
+        """List all bills (recurring expenses)."""
+        return self._get_all_pages("bills")
+
+    def get_recurrences(self) -> list[dict]:
+        """List all recurring transactions."""
+        return self._get_all_pages("recurrences")
+
+    def search_accounts(self, query: str, account_type: str = "asset") -> list[dict]:
+        """Search accounts by name."""
+        return self._get_all_pages("search/accounts", {"query": query, "type": account_type, "field": "name"})

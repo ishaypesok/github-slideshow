@@ -85,14 +85,112 @@ def _get_monthly_ranges(months_back: int) -> list[tuple[date, date, str]]:
     return ranges
 
 
+def _match_account(account_name: str, account_id: str, filters: list[str]) -> bool:
+    """Check if an account matches any of the filter strings (partial match)."""
+    for f in filters:
+        f_lower = f.lower()
+        if f_lower in account_name.lower() or f_lower == str(account_id):
+            return True
+    return False
+
+
+def _resolve_account_ids(client: FireflyClient, filters: list[str]) -> list[str]:
+    """Find account IDs matching the filter strings."""
+    matched_ids = []
+    for acct_type in ["asset", "expense"]:
+        try:
+            accounts = client.get_accounts(acct_type)
+        except Exception:
+            continue
+        for acct in accounts:
+            attrs = acct.get("attributes", {})
+            name = attrs.get("name", "")
+            aid = str(acct.get("id", ""))
+            if _match_account(name, aid, filters):
+                matched_ids.append(aid)
+                logger.info("Matched account: %s (ID: %s)", name, aid)
+    return matched_ids
+
+
+def _get_filtered_expenses(
+    client: FireflyClient,
+    start: date,
+    end: date,
+    account_ids: list[str] | None = None,
+    recurring_only: bool = False,
+) -> list[dict]:
+    """Get transactions filtered by accounts and/or recurring status.
+
+    Returns a list of individual transaction dicts with keys:
+    amount, category_name, source_name, destination_name, bill_id, etc.
+    """
+    transactions = []
+
+    if account_ids:
+        for aid in account_ids:
+            try:
+                tx_groups = client.get_account_transactions(aid, start, end, tx_type="withdrawal")
+            except Exception:
+                continue
+            for group in tx_groups:
+                attrs = group.get("attributes", {})
+                for tx in attrs.get("transactions", []):
+                    transactions.append(tx)
+    else:
+        try:
+            tx_groups = client.get_transactions(start, end, tx_type="withdrawal")
+        except Exception:
+            tx_groups = []
+        for group in tx_groups:
+            attrs = group.get("attributes", {})
+            for tx in attrs.get("transactions", []):
+                transactions.append(tx)
+
+    if recurring_only:
+        transactions = [
+            tx for tx in transactions
+            if tx.get("bill_id") or tx.get("recurrence_id")
+        ]
+
+    return transactions
+
+
+def _aggregate_by_category(transactions: list[dict]) -> dict[str, float]:
+    """Sum transaction amounts by category."""
+    by_cat: dict[str, float] = {}
+    for tx in transactions:
+        cat = tx.get("category_name") or "Uncategorized"
+        amount = abs(float(tx.get("amount", 0)))
+        by_cat[cat] = by_cat.get(cat, 0) + amount
+    return by_cat
+
+
+def _aggregate_total(transactions: list[dict]) -> float:
+    """Sum all transaction amounts."""
+    return sum(abs(float(tx.get("amount", 0))) for tx in transactions)
+
+
 class ReportGenerator:
     """Generates Excel reports from Firefly III data."""
 
-    def __init__(self, client: FireflyClient, months_back: int = 12, forecast_months: int = 3):
+    def __init__(
+        self,
+        client: FireflyClient,
+        months_back: int = 12,
+        forecast_months: int = 3,
+        filter_config: dict | None = None,
+    ):
         self.client = client
         self.months_back = months_back
         self.forecast_months = forecast_months
         self.wb = Workbook()
+        self.filter_config = filter_config or {}
+        self.use_filters = bool(
+            self.filter_config.get("account_filters") or self.filter_config.get("recurring_only")
+        )
+        self._account_ids: list[str] | None = None
+        if self.filter_config.get("account_filters"):
+            self._account_ids = _resolve_account_ids(client, self.filter_config["account_filters"])
 
     def generate(self, output_path: str):
         """Generate the full forecasting report."""
@@ -139,14 +237,22 @@ class ReportGenerator:
             except Exception:
                 inc_total = 0.0
 
-            try:
-                exp_data = self.client.get_insight_expense_total(start, end)
-                exp_total = sum(
-                    abs(float(item.get("difference_float", 0)))
-                    for item in exp_data
+            if self.use_filters:
+                filtered_txs = _get_filtered_expenses(
+                    self.client, start, end,
+                    account_ids=self._account_ids,
+                    recurring_only=self.filter_config.get("recurring_only", False),
                 )
-            except Exception:
-                exp_total = 0.0
+                exp_total = _aggregate_total(filtered_txs)
+            else:
+                try:
+                    exp_data = self.client.get_insight_expense_total(start, end)
+                    exp_total = sum(
+                        abs(float(item.get("difference_float", 0)))
+                        for item in exp_data
+                    )
+                except Exception:
+                    exp_total = 0.0
 
             incomes.append(inc_total)
             expenses.append(exp_total)
@@ -227,22 +333,40 @@ class ReportGenerator:
 
         for start, end, label in monthly_ranges:
             month_labels.append(label)
-            try:
-                data = self.client.get_insight_expense_category(start, end)
-            except Exception:
-                data = []
-            seen = set()
-            for item in data:
-                name = item.get("name", "Uncategorized")
-                amount = abs(float(item.get("difference_float", 0)))
-                if name not in category_monthly:
-                    category_monthly[name] = [0.0] * len(month_labels[:-1])
-                category_monthly[name].append(amount)
-                seen.add(name)
-            # Fill zeros for categories not in this month
-            for name in category_monthly:
-                if name not in seen:
-                    category_monthly[name].append(0.0)
+
+            if self.use_filters:
+                filtered_txs = _get_filtered_expenses(
+                    self.client, start, end,
+                    account_ids=self._account_ids,
+                    recurring_only=self.filter_config.get("recurring_only", False),
+                )
+                cat_amounts = _aggregate_by_category(filtered_txs)
+                seen = set()
+                for name, amount in cat_amounts.items():
+                    if name not in category_monthly:
+                        category_monthly[name] = [0.0] * len(month_labels[:-1])
+                    category_monthly[name].append(amount)
+                    seen.add(name)
+                for name in category_monthly:
+                    if name not in seen:
+                        category_monthly[name].append(0.0)
+            else:
+                try:
+                    data = self.client.get_insight_expense_category(start, end)
+                except Exception:
+                    data = []
+                seen = set()
+                for item in data:
+                    name = item.get("name", "Uncategorized")
+                    amount = abs(float(item.get("difference_float", 0)))
+                    if name not in category_monthly:
+                        category_monthly[name] = [0.0] * len(month_labels[:-1])
+                    category_monthly[name].append(amount)
+                    seen.add(name)
+                # Fill zeros for categories not in this month
+                for name in category_monthly:
+                    if name not in seen:
+                        category_monthly[name].append(0.0)
 
         if not category_monthly:
             ws.cell(row=1, column=1, value="No expense data found.")
