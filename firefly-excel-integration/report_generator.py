@@ -85,6 +85,19 @@ def _get_monthly_ranges(months_back: int) -> list[tuple[date, date, str]]:
     return ranges
 
 
+def _forecast_label_from_ranges(monthly_ranges: list, i: int) -> str:
+    """Generate a forecast month label based on the last month in monthly_ranges."""
+    if monthly_ranges:
+        last_start = monthly_ranges[-1][0]
+        fm = last_start.month + i + 1
+        fy = last_start.year
+        while fm > 12:
+            fm -= 12
+            fy += 1
+        return date(fy, fm, 1).strftime("%b %Y") + " (F)"
+    return f"Forecast {i + 1}"
+
+
 def _match_account(account_name: str, account_id: str, filters: list[str]) -> bool:
     """Check if an account matches any of the filter strings (partial match)."""
     for f in filters:
@@ -202,7 +215,7 @@ class ReportGenerator:
         self._build_summary_sheet()
         self._build_expense_by_category_sheet()
         self._build_income_sheet()
-        self._build_transactions_sheet()
+        self._build_expense_by_account_sheet()
         self._build_budget_sheet()
         self._build_accounts_sheet()
 
@@ -490,82 +503,101 @@ class ReportGenerator:
         for col in range(2, total_cols + 1):
             ws.column_dimensions[get_column_letter(col)].width = 14
 
-    def _build_transactions_sheet(self):
-        """Individual transactions with source account details."""
-        ws = self.wb.create_sheet("Transactions")
+    def _build_expense_by_account_sheet(self):
+        """Monthly expenses per source account + forecast."""
+        ws = self.wb.create_sheet("Expenses by Account")
         monthly_ranges = _get_monthly_ranges(self.months_back)
 
-        headers = ["Date", "Amount", "Source Account", "Destination", "Category", "Description", "Bill/Recurring"]
+        account_monthly: dict[str, list[float]] = {}
+        month_labels = []
+
+        for start, end, label in monthly_ranges:
+            month_labels.append(label)
+
+            transactions = []
+            if self._account_ids:
+                for aid in self._account_ids:
+                    try:
+                        tx_groups = self.client.get_account_transactions(aid, start, end, tx_type="withdrawal")
+                    except Exception:
+                        continue
+                    for group in tx_groups:
+                        attrs = group.get("attributes", {})
+                        for tx in attrs.get("transactions", []):
+                            transactions.append(tx)
+            else:
+                try:
+                    tx_groups = self.client.get_transactions(start, end, tx_type="withdrawal")
+                except Exception:
+                    tx_groups = []
+                for group in tx_groups:
+                    attrs = group.get("attributes", {})
+                    for tx in attrs.get("transactions", []):
+                        transactions.append(tx)
+
+            if self.filter_config.get("recurring_only", False):
+                transactions = [
+                    tx for tx in transactions
+                    if tx.get("bill_id") or tx.get("recurrence_id")
+                ]
+
+            seen = set()
+            for tx in transactions:
+                source = tx.get("source_name") or "Unknown"
+                amount = abs(float(tx.get("amount", 0)))
+                if source not in account_monthly:
+                    account_monthly[source] = [0.0] * len(month_labels[:-1])
+                account_monthly[source].append(amount)
+                seen.add(source)
+            for name in account_monthly:
+                if name not in seen:
+                    account_monthly[name].append(0.0)
+
+        if not account_monthly:
+            ws.cell(row=1, column=1, value="No expense data found.")
+            return
+
+        accounts_sorted = sorted(account_monthly.keys())
+        forecast_labels = [
+            _forecast_label_from_ranges(monthly_ranges, i)
+            for i in range(self.forecast_months)
+        ]
+        headers = ["Source Account"] + month_labels + forecast_labels
         for col, header in enumerate(headers, 1):
             ws.cell(row=1, column=col, value=header)
         _style_header_row(ws, 1, len(headers))
 
-        if monthly_ranges:
-            start = monthly_ranges[0][0]
-            end = monthly_ranges[-1][1]
-        else:
-            start = date.today() - timedelta(days=365)
-            end = date.today()
-
-        recurring_only = self.filter_config.get("recurring_only", False)
-
-        all_transactions = []
-        if self._account_ids:
-            for aid in self._account_ids:
-                try:
-                    tx_groups = self.client.get_account_transactions(aid, start, end, tx_type="withdrawal")
-                except Exception:
-                    continue
-                for group in tx_groups:
-                    attrs = group.get("attributes", {})
-                    for tx in attrs.get("transactions", []):
-                        all_transactions.append(tx)
-        else:
-            try:
-                tx_groups = self.client.get_transactions(start, end, tx_type="withdrawal")
-            except Exception:
-                tx_groups = []
-            for group in tx_groups:
-                attrs = group.get("attributes", {})
-                for tx in attrs.get("transactions", []):
-                    all_transactions.append(tx)
-
-        if recurring_only:
-            all_transactions = [
-                tx for tx in all_transactions
-                if tx.get("bill_id") or tx.get("recurrence_id")
-            ]
-
-        all_transactions.sort(key=lambda tx: tx.get("date", ""), reverse=True)
-
-        for idx, tx in enumerate(all_transactions):
+        for idx, acct_name in enumerate(accounts_sorted):
             row = idx + 2
-            tx_date = tx.get("date", "")[:10]
-            amount = abs(float(tx.get("amount", 0)))
-            source = tx.get("source_name", "")
-            destination = tx.get("destination_name", "")
-            category = tx.get("category_name") or ""
-            description = tx.get("description", "")
-            is_bill = "Yes" if tx.get("bill_id") else ""
-            if tx.get("recurrence_id"):
-                is_bill = "Yes (recurring)"
+            values = account_monthly[acct_name]
+            forecasts = [max(0, v) for v in _linear_forecast(values, self.forecast_months)]
 
-            ws.cell(row=row, column=1, value=tx_date)
+            ws.cell(row=row, column=1, value=acct_name)
             _style_data_cell(ws, row, 1)
-            _style_data_cell(ws, row, 2, is_currency=True).value = amount
-            _style_data_cell(ws, row, 3).value = source
-            _style_data_cell(ws, row, 4).value = destination
-            _style_data_cell(ws, row, 5).value = category
-            _style_data_cell(ws, row, 6).value = description
-            _style_data_cell(ws, row, 7).value = is_bill
+            for col_idx, val in enumerate(values, 2):
+                _style_data_cell(ws, row, col_idx, is_currency=True).value = val
+            for col_idx, val in enumerate(forecasts, len(values) + 2):
+                cell = _style_data_cell(ws, row, col_idx, is_currency=True)
+                cell.value = val
+                cell.fill = FORECAST_FILL
 
-        ws.column_dimensions["A"].width = 12
-        ws.column_dimensions["B"].width = 14
-        ws.column_dimensions["C"].width = 25
-        ws.column_dimensions["D"].width = 25
-        ws.column_dimensions["E"].width = 20
-        ws.column_dimensions["F"].width = 35
-        ws.column_dimensions["G"].width = 15
+        # Total row
+        total_row = len(accounts_sorted) + 2
+        ws.cell(row=total_row, column=1, value="TOTAL")
+        ws.cell(row=total_row, column=1).font = Font(bold=True)
+        for col_idx in range(2, len(headers) + 1):
+            total = sum(
+                ws.cell(row=r, column=col_idx).value or 0
+                for r in range(2, total_row)
+            )
+            cell = _style_data_cell(ws, total_row, col_idx, is_currency=True)
+            cell.value = total
+            cell.font = Font(bold=True)
+
+        ws.column_dimensions["A"].width = 30
+        total_cols = len(headers)
+        for col in range(2, total_cols + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 14
 
     def _build_budget_sheet(self):
         """Budget overview with spent vs budgeted."""
